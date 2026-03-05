@@ -320,6 +320,14 @@ def diarize(audio_path, hf_token):
 
     print("  Loading diarization model (first run downloads ~1 GB)...")
     try:
+        # PyTorch 2.6+ defaults weights_only=True which breaks pyannote checkpoints.
+        # Patch torch.load to trust pyannote's HuggingFace models.
+        import torch
+        _orig_load = torch.load
+        torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
+    except Exception:
+        pass
+    try:
         from huggingface_hub import login as hf_login
         hf_login(token=hf_token, add_to_git_credential=False)
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
@@ -330,7 +338,7 @@ def diarize(audio_path, hf_token):
         return None
 
     try:
-        import torch
+        torch.load = _orig_load  # restore after loading
         if torch.backends.mps.is_available():
             pipeline = pipeline.to(torch.device("mps"))
     except Exception:
