@@ -33,6 +33,38 @@ CHUNK_MINUTES = 10
 CHUNK_OVERLAP_SECONDS = 15
 GENDER_ANALYSIS_MAX_SEGMENTS = 3000
 
+CACHE_VERSION = 1  # bump to invalidate all caches
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers  (saved as <video>.cache.json next to the video file)
+# ---------------------------------------------------------------------------
+
+def _cache_path(video_path):
+    return str(Path(video_path).with_suffix(".cache.json"))
+
+
+def _load_cache(video_path):
+    path = _cache_path(video_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("cache_version") != CACHE_VERSION:
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def _save_cache(video_path, cache):
+    cache["cache_version"] = CACHE_VERSION
+    path = _cache_path(video_path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    print(f"  [cache saved → {Path(path).name}]")
+
 
 # ---------------------------------------------------------------------------
 # Temp file cleanup
@@ -362,11 +394,16 @@ Include every identifiable speaker. Be thorough with evidence.
 """
 
 
-def analyze_genders(segments, hints=""):
+def analyze_genders(segments, hints="", cache=None, cache_save=None):
     """
     Pass 1: send full transcript to Claude to build a speaker→gender map.
     Returns (gender_context_string, speaker_map dict {speaker_id: {name, gender}}).
     """
+    if cache and cache.get("gender_analysis"):
+        stored = cache["gender_analysis"]
+        print(f"Using cached gender analysis: {len(stored.get('speakers', []))} speakers")
+        return _build_gender_outputs(stored)
+
     print("Analyzing speaker genders across full transcript...")
 
     lines = []
@@ -399,38 +436,15 @@ def analyze_genders(segments, hints=""):
                 raw = raw.strip()
 
             data = json.loads(raw)
-            speakers = data.get("speakers", [])
-            address_notes = data.get("address_notes", "")
-
-            if not speakers:
+            if not data.get("speakers"):
                 return "", {}
 
-            # Build speaker_map: {id -> {name, gender}}
-            speaker_map = {}
-            for sp in speakers:
-                speaker_map[sp.get("id", sp.get("name", ""))] = {
-                    "name": sp.get("name", ""),
-                    "gender": sp.get("gender", "unknown"),
-                }
+            if cache is not None:
+                cache["gender_analysis"] = data
+                if cache_save:
+                    cache_save()
 
-            # Build human-readable context block
-            out = ["=== CAST & GENDER REFERENCE (apply consistently throughout) ==="]
-            for sp in speakers:
-                gender_label = sp.get("gender", "unknown").upper()
-                name = sp.get("name", "?")
-                sid = sp.get("id", "")
-                evidence = sp.get("evidence", "")
-                id_part = f" ({sid})" if sid and sid != name else ""
-                out.append(f"  • {name}{id_part}: {gender_label}  — {evidence}")
-            if address_notes:
-                out.append(f"\n  Address notes: {address_notes}")
-            out.append("=== END CAST REFERENCE ===")
-
-            context_str = "\n".join(out)
-            print(f"  Found {len(speakers)} speakers:")
-            for sp in speakers:
-                print(f"    {sp.get('name')}: {sp.get('gender')} — {sp.get('evidence')}")
-
+            context_str, speaker_map = _build_gender_outputs(data)
             return context_str, speaker_map
 
         except Exception as e:
@@ -442,6 +456,38 @@ def analyze_genders(segments, hints=""):
                 return "", {}
 
     return "", {}
+
+
+def _build_gender_outputs(data):
+    """Build context string and speaker_map from gender analysis data dict."""
+    speakers = data.get("speakers", [])
+    address_notes = data.get("address_notes", "")
+
+    speaker_map = {}
+    for sp in speakers:
+        speaker_map[sp.get("id", sp.get("name", ""))] = {
+            "name": sp.get("name", ""),
+            "gender": sp.get("gender", "unknown"),
+        }
+
+    out = ["=== CAST & GENDER REFERENCE (apply consistently throughout) ==="]
+    for sp in speakers:
+        gender_label = sp.get("gender", "unknown").upper()
+        name = sp.get("name", "?")
+        sid = sp.get("id", "")
+        evidence = sp.get("evidence", "")
+        id_part = f" ({sid})" if sid and sid != name else ""
+        out.append(f"  • {name}{id_part}: {gender_label}  — {evidence}")
+    if address_notes:
+        out.append(f"\n  Address notes: {address_notes}")
+    out.append("=== END CAST REFERENCE ===")
+
+    context_str = "\n".join(out)
+    print(f"  {len(speakers)} speakers in cast reference:")
+    for sp in speakers:
+        print(f"    {sp.get('name')}: {sp.get('gender')} — {sp.get('evidence', '')[:80]}")
+
+    return context_str, speaker_map
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +523,13 @@ Return ONLY a valid JSON array (no markdown, no explanation):
 CONTEXT_ONLY_NOTE = " [CONTEXT ONLY — do not include in output]"
 
 
-def translate(segments, hints=""):
+def translate(segments, hints="", cache=None, cache_save=None):
     """Translate all segments to Hebrew using Claude. Returns translated segments."""
     if not segments:
         return []
 
-    gender_context, speaker_map = analyze_genders(segments, hints=hints)
+    gender_context, speaker_map = analyze_genders(segments, hints=hints,
+                                                   cache=cache, cache_save=cache_save)
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         gender_context=gender_context if gender_context
@@ -669,6 +716,10 @@ def main():
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
+    cache = _load_cache(input_path)
+    if cache:
+        print(f"Loaded cache: {_cache_path(input_path)}")
+
     # Step 1: Extract audio
     print(f"Extracting audio from: {input_path}")
     audio_path = extract_audio(input_path)
@@ -683,24 +734,38 @@ def main():
         print(f"Audio saved to: {audio_path}")
 
     # Step 2: Get transcript (embedded subs preferred, Whisper fallback)
-    print("Checking for embedded subtitles...")
-    segments = extract_embedded_subtitles(input_path)
-    if segments:
-        print(f"Using embedded subtitles: {len(segments)} segments (frame-accurate timing)")
+    if cache.get("segments"):
+        print(f"Using cached transcript: {len(cache['segments'])} segments")
+        segments = cache["segments"]
     else:
-        print("No embedded subtitles found — transcribing with Whisper...")
-        segments = transcribe(audio_path)
-        print(f"Transcribed {len(segments)} segments")
+        print("Checking for embedded subtitles...")
+        segments = extract_embedded_subtitles(input_path)
+        if segments:
+            print(f"Using embedded subtitles: {len(segments)} segments (frame-accurate timing)")
+        else:
+            print("No embedded subtitles found — transcribing with Whisper...")
+            segments = transcribe(audio_path)
+            print(f"Transcribed {len(segments)} segments")
+        cache["segments"] = segments
+        _save_cache(input_path, cache)
 
     if not segments:
         sys.exit("No speech segments found.")
 
     # Step 3: Speaker diarization
     if not args.no_diarize:
-        if hf_token:
+        if cache.get("diarization_turns"):
+            print(f"Using cached diarization: {len(cache['diarization_turns'])} speaker turns")
+            turns = cache["diarization_turns"]
+            segments = assign_speakers(segments, turns)
+            unique_speakers = len({s["speaker"] for s in segments})
+            print(f"  Assigned {unique_speakers} speakers across {len(segments)} segments")
+        elif hf_token:
             print("Running speaker diarization...")
             turns = diarize(audio_path, hf_token)
             if turns:
+                cache["diarization_turns"] = turns
+                _save_cache(input_path, cache)
                 segments = assign_speakers(segments, turns)
                 unique_speakers = len({s["speaker"] for s in segments})
                 print(f"  Assigned {unique_speakers} speakers across {len(segments)} segments")
@@ -711,9 +776,10 @@ def main():
             print("  Get a free token at: https://huggingface.co/settings/tokens")
             print("  Accept license at: https://huggingface.co/pyannote/speaker-diarization-3.1")
 
-    # Step 4: Translate
+    # Step 4: Translate (gender analysis is cached inside translate())
     print("Translating to Hebrew with Claude...")
-    translated = translate(segments, hints=args.hints)
+    translated = translate(segments, hints=args.hints, cache=cache,
+                           cache_save=lambda: _save_cache(input_path, cache))
 
     # Step 5: Write SRT
     write_srt(translated, output_path)
