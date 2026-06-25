@@ -147,14 +147,15 @@ def split_audio(audio_path):
 # Step 2a — Embedded subtitle extraction (preferred for timing accuracy)
 # ---------------------------------------------------------------------------
 
-def extract_embedded_subtitles(video_path):
+def extract_embedded_subtitles(video_path, subtitle_track=None):
     """
     Try to extract an English subtitle stream from the video.
+    subtitle_track: 1-indexed subtitle track number; None = auto (first English, skip Forced).
     Returns list of segment dicts or None if no subtitle stream found.
     """
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "s",
-         "-show_entries", "stream=index:stream_tags=language",
+         "-show_entries", "stream=index:stream_tags=language,title",
          "-of", "json", video_path],
         capture_output=True, text=True,
     )
@@ -169,15 +170,28 @@ def extract_embedded_subtitles(video_path):
     if not streams:
         return None
 
-    # Prefer English, fall back to first available
-    target_index = None
-    for stream in streams:
-        lang = stream.get("tags", {}).get("language", "")
-        if lang in ("eng", "en"):
-            target_index = stream["index"]
-            break
-    if target_index is None:
-        target_index = streams[0]["index"]
+    if subtitle_track is not None:
+        idx = subtitle_track - 1
+        if idx < 0 or idx >= len(streams):
+            sys.exit(f"--subtitle-track {subtitle_track} out of range (file has {len(streams)} subtitle track(s))")
+        target_index = streams[idx]["index"]
+    else:
+        # Prefer English non-forced, fall back to first English, then first available
+        target_index = None
+        for stream in streams:
+            lang = stream.get("tags", {}).get("language", "")
+            title = stream.get("tags", {}).get("title", "").lower()
+            if lang in ("eng", "en") and "forced" not in title:
+                target_index = stream["index"]
+                break
+        if target_index is None:
+            for stream in streams:
+                lang = stream.get("tags", {}).get("language", "")
+                if lang in ("eng", "en"):
+                    target_index = stream["index"]
+                    break
+        if target_index is None:
+            target_index = streams[0]["index"]
 
     srt_path = make_temp(".srt")
     result = subprocess.run(
@@ -414,10 +428,16 @@ def analyze_genders(segments, hints="", cache=None, cache_save=None):
 
     print("Analyzing speaker genders across full transcript...")
 
+    MAX_GENDER_CHARS = 300_000  # ~75K tokens, well under 1M limit
     lines = []
+    total_chars = 0
     for seg in segments[:GENDER_ANALYSIS_MAX_SEGMENTS]:
         speaker_prefix = f"[{seg['speaker']}] " if seg.get("speaker") else ""
-        lines.append(f"[{seg['id']}] {speaker_prefix}{seg['text']}")
+        line = f"[{seg['id']}] {speaker_prefix}{seg['text']}"
+        if total_chars + len(line) > MAX_GENDER_CHARS:
+            break
+        lines.append(line)
+        total_chars += len(line) + 1
     transcript_text = "\n".join(lines)
 
     hint_section = f"\n\nUser hints: {hints}" if hints else ""
@@ -432,7 +452,7 @@ def analyze_genders(segments, hints="", cache=None, cache_save=None):
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
+                max_tokens=8192,
                 system=GENDER_ANALYSIS_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -443,7 +463,7 @@ def analyze_genders(segments, hints="", cache=None, cache_save=None):
                     raw = raw[4:]
                 raw = raw.strip()
 
-            data = json.loads(raw)
+            data = _parse_gender_json(raw)
             if not data.get("speakers"):
                 return "", {}
 
@@ -464,6 +484,33 @@ def analyze_genders(segments, hints="", cache=None, cache_save=None):
                 return "", {}
 
     return "", {}
+
+
+def _parse_gender_json(raw):
+    """Parse gender analysis JSON, recovering partial results if truncated."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to salvage complete speaker objects from a truncated response
+    import re
+    speaker_objects = re.findall(
+        r'\{[^{}]*"id"\s*:\s*"[^"]*"[^{}]*"gender"\s*:\s*"(?:male|female|unknown)"[^{}]*\}',
+        raw,
+    )
+    speakers = []
+    for obj in speaker_objects:
+        try:
+            speakers.append(json.loads(obj))
+        except json.JSONDecodeError:
+            continue
+
+    if speakers:
+        print(f"  Recovered {len(speakers)} speakers from partial JSON response.")
+        return {"speakers": speakers, "address_notes": ""}
+
+    raise ValueError("Could not parse or recover gender analysis JSON")
 
 
 def _build_gender_outputs(data):
@@ -655,7 +702,7 @@ def _translate_batch(batch, hints, system_prompt, speaker_map, context_tail=None
                 else:
                     time.sleep(10)
             else:
-                sys.exit(f"Translation failed after retry: {e}")
+                raise RuntimeError(f"Translation failed after retry: {e}")
 
     return batch
 
@@ -695,35 +742,11 @@ def write_srt(segments, output_path):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Translate video audio to Hebrew subtitles (.srt)",
-    )
-    parser.add_argument("input", help="Input video file")
-    parser.add_argument("-o", "--output", help="Output .srt path (default: <input>.srt)")
-    parser.add_argument("--hints", default="",
-                        help='Gender hints (e.g. "female host, male guest")')
-    parser.add_argument("--keep-audio", action="store_true",
-                        help="Keep extracted audio file")
-    parser.add_argument("--hf-token", default="",
-                        help="HuggingFace token for speaker diarization (or set HF_TOKEN env var)")
-    parser.add_argument("--no-diarize", action="store_true",
-                        help="Skip speaker diarization")
-    args = parser.parse_args()
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".flv", ".webm"}
 
-    input_path = args.input
-    if not os.path.exists(input_path):
-        sys.exit(f"Input file not found: {input_path}")
 
-    output_path = args.output or str(Path(input_path).with_suffix(".srt"))
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        sys.exit("OPENAI_API_KEY not set.")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY not set.")
-
-    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
-
+def process_file(input_path, output_path, hints, keep_audio, hf_token, no_diarize, subtitle_track=None):
+    """Translate a single video file to Hebrew SRT."""
     cache = _load_cache(input_path)
     if cache:
         print(f"Loaded cache: {_cache_path(input_path)}")
@@ -734,7 +757,7 @@ def main():
     size_mb = os.path.getsize(audio_path) / 1024 / 1024
     print(f"Audio extracted: {size_mb:.1f} MB")
 
-    if args.keep_audio:
+    if keep_audio:
         _temp_files.remove(audio_path)
         kept_path = str(Path(input_path).with_suffix(".mp3"))
         os.rename(audio_path, kept_path)
@@ -747,7 +770,7 @@ def main():
         segments = cache["segments"]
     else:
         print("Checking for embedded subtitles...")
-        segments = extract_embedded_subtitles(input_path)
+        segments = extract_embedded_subtitles(input_path, subtitle_track=subtitle_track)
         if segments:
             print(f"Using embedded subtitles: {len(segments)} segments (frame-accurate timing)")
         else:
@@ -758,10 +781,11 @@ def main():
         _save_cache(input_path, cache)
 
     if not segments:
-        sys.exit("No speech segments found.")
+        print("No speech segments found — skipping.")
+        return
 
     # Step 3: Speaker diarization
-    if not args.no_diarize:
+    if not no_diarize:
         if cache.get("diarization_turns"):
             print(f"Using cached diarization: {len(cache['diarization_turns'])} speaker turns")
             turns = cache["diarization_turns"]
@@ -786,11 +810,81 @@ def main():
 
     # Step 4: Translate (gender analysis is cached inside translate())
     print("Translating to Hebrew with Claude...")
-    translated = translate(segments, hints=args.hints, cache=cache,
+    translated = translate(segments, hints=hints, cache=cache,
                            cache_save=lambda: _save_cache(input_path, cache))
 
     # Step 5: Write SRT
     write_srt(translated, output_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Translate video audio to Hebrew subtitles (.srt)",
+    )
+    parser.add_argument("input", help="Input video file or folder")
+    parser.add_argument("-o", "--output", help="Output .srt path (single file mode only)")
+    parser.add_argument("--hints", default="",
+                        help='Gender hints (e.g. "female host, male guest")')
+    parser.add_argument("--keep-audio", action="store_true",
+                        help="Keep extracted audio file")
+    parser.add_argument("--hf-token", default="",
+                        help="HuggingFace token for speaker diarization (or set HF_TOKEN env var)")
+    parser.add_argument("--no-diarize", action="store_true",
+                        help="Skip speaker diarization")
+    parser.add_argument("--skip-existing", action="store_true", default=True,
+                        help="Skip videos that already have an .srt file (default: true)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-translate even if .srt already exists")
+    parser.add_argument("--subtitle-track", type=int, default=None, metavar="N",
+                        help="1-indexed subtitle track to use (default: auto-select first English non-forced)")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        sys.exit(f"Input not found: {args.input}")
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("OPENAI_API_KEY not set.")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY not set.")
+
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
+
+    # Folder mode
+    if os.path.isdir(args.input):
+        folder = Path(args.input)
+        videos = sorted(
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+        )
+        if not videos:
+            sys.exit(f"No video files found in: {folder}")
+
+        print(f"Found {len(videos)} video(s) in: {folder}\n")
+        done, skipped, failed = 0, 0, 0
+        for i, video in enumerate(videos, 1):
+            output_path = str(video.with_suffix(".srt"))
+            if not args.force and Path(output_path).exists():
+                print(f"[{i}/{len(videos)}] Skipping (already translated): {video.name}")
+                skipped += 1
+                continue
+            print(f"[{i}/{len(videos)}] Processing: {video.name}")
+            try:
+                process_file(str(video), output_path, args.hints, args.keep_audio,
+                             hf_token, args.no_diarize, args.subtitle_track)
+                done += 1
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                failed += 1
+            print()
+
+        print(f"Done — {done} translated, {skipped} skipped, {failed} failed.")
+        return
+
+    # Single file mode
+    output_path = args.output or str(Path(args.input).with_suffix(".srt"))
+    if not args.force and Path(output_path).exists():
+        print(f"Output already exists: {output_path} (use --force to re-translate)")
+    process_file(args.input, output_path, args.hints, args.keep_audio, hf_token, args.no_diarize, args.subtitle_track)
 
 
 if __name__ == "__main__":
