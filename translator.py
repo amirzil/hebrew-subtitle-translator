@@ -570,9 +570,12 @@ Your task:
 5. Produce natural, fluent Hebrew — not word-for-word.
 6. Preserve segment IDs and timestamps exactly.
 7. Do NOT include the speaker label in the output text.
+8. NEVER use a straight ASCII double-quote character (") inside translated text — it breaks
+   the output format. For Hebrew abbreviations/ranks that use gershayim (e.g. רס״ן, סמ״ר),
+   use the Hebrew gershayim character ״ (U+05F4), not ". For quoted speech, use Hebrew-style
+   quotation marks “ ” — never a bare ".
 
-Return ONLY a valid JSON array (no markdown, no explanation):
-[{{"id": <int>, "start": <float>, "end": <float>, "text": "<Hebrew translation>"}}]
+Call the submit_translations tool with the translated segments.
 """
 
 CONTEXT_ONLY_NOTE = " [CONTEXT ONLY — do not include in output]"
@@ -633,6 +636,35 @@ def _translate_batched(segments, hints, system_prompt, speaker_map):
     return output
 
 
+class _TruncatedResponse(Exception):
+    """Raised when Claude's response was cut off by the max_tokens limit."""
+
+
+TRANSLATE_TOOL = {
+    "name": "submit_translations",
+    "description": "Submit the Hebrew translations for the given transcript segments.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "translations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Segment id, copied exactly from input"},
+                        "start": {"type": "number"},
+                        "end": {"type": "number"},
+                        "text": {"type": "string", "description": "Hebrew translation"},
+                    },
+                    "required": ["id", "start", "end", "text"],
+                },
+            },
+        },
+        "required": ["translations"],
+    },
+}
+
+
 def _translate_batch(batch, hints, system_prompt, speaker_map, context_tail=None):
     context_tail = context_tail or []
     hint_section = f"\n\nAdditional user hints: {hints}" if hints else ""
@@ -658,7 +690,8 @@ def _translate_batch(batch, hints, system_prompt, speaker_map, context_tail=None
     user_msg = (
         f"Translate the following transcript segments to Hebrew.{hint_section}\n\n"
         f"Each segment may have a 'speaker_label' indicating who is speaking and their gender. "
-        f"Context-only segments at the end must NOT appear in output.\n\n"
+        f"Context-only segments at the end must NOT appear in output. "
+        f"Call submit_translations with the translated segments.\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
@@ -669,19 +702,20 @@ def _translate_batch(batch, hints, system_prompt, speaker_map, context_tail=None
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=8192,
+                max_tokens=16384,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_msg}],
+                tools=[TRANSLATE_TOOL],
+                tool_choice={"type": "tool", "name": "submit_translations"},
             )
-            raw = response.content[0].text.strip()
+            if response.stop_reason == "max_tokens" and len(batch) > 1:
+                raise _TruncatedResponse()
 
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
-
-            translated = json.loads(raw)
+            tool_use = next(b for b in response.content if b.type == "tool_use")
+            translated = tool_use.input["translations"]
+            if isinstance(translated, str):
+                translated = json.loads(translated)
+            translated = [json.loads(t) if isinstance(t, str) else t for t in translated]
 
             returned_ids = {seg["id"] for seg in translated}
             if not expected_ids.issubset(returned_ids):
@@ -690,13 +724,24 @@ def _translate_batch(batch, hints, system_prompt, speaker_map, context_tail=None
 
             return [seg for seg in translated if seg["id"] in expected_ids]
 
+        except _TruncatedResponse:
+            mid = len(batch) // 2
+            print(f"\n  Response truncated (max_tokens) — splitting batch of {len(batch)} "
+                  f"into {mid} + {len(batch) - mid} and retrying...")
+            tail_for_first = batch[mid:mid + BATCH_OVERLAP]
+            first = _translate_batch(batch[:mid], hints, system_prompt, speaker_map,
+                                     context_tail=tail_for_first)
+            second = _translate_batch(batch[mid:], hints, system_prompt, speaker_map,
+                                      context_tail=context_tail)
+            return first + second
+
         except Exception as e:
             if attempt == 0:
                 print(f"\n  Translation error: {e} — retrying...")
-                if isinstance(e, (json.JSONDecodeError, ValueError)):
+                if isinstance(e, (StopIteration, KeyError, ValueError, TypeError)):
                     user_msg = (
                         f"Your previous response had an issue: {e}\n\n"
-                        f"Please try again. Return ONLY a valid JSON array for these segments:\n"
+                        f"Please try again, calling submit_translations with these segments:\n"
                         f"{json.dumps([_enrich(s) for s in batch], ensure_ascii=False, indent=2)}"
                     )
                 else:
