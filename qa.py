@@ -39,6 +39,8 @@ SHIFT_MIN_LOCAL = 0.5           # shift a region only if its offset is at least 
 SHIFT_MIN_LINE = 1.5            # shift a single line only if it deviates this much (s)
 MIN_COVERAGE = 0.25             # below this, the subtitles don't match the audio
 OVERLAP_GAP = 0.04
+MIN_READ_S = 1.0                # a neighbour is never squeezed below this...
+READ_CPS = 17.0                 # ...or below its length at this reading speed
 
 # Report-only checks
 MAX_CPS = 20.0
@@ -219,6 +221,11 @@ def _match_lines_to_words(source_segments, words):
     return measured
 
 
+def _min_read(text):
+    """Shortest time a subtitle should stay on screen to be readable."""
+    return max(MIN_READ_S, len(re.sub(r"\s+", "", text)) / READ_CPS)
+
+
 def align_timing(segments, source_segments, words, report):
     """Shift subtitle timings to match the speech in the audio. Mutates and returns segments."""
     src_index = {s["id"]: i for i, s in enumerate(source_segments)}
@@ -269,6 +276,7 @@ def align_timing(segments, source_segments, words, report):
         local = local_offset(i)
         plan[seg["id"]] = (local, "region_offset") if abs(local) >= SHIFT_MIN_LOCAL else (0.0, None)
     start_by_id = {s["id"]: s["start"] for s in segments}
+    text_by_id = {s["id"]: s["text"] for s in segments}
     base_start = {sid: start_by_id[sid] + sh for sid, (sh, _) in plan.items()}
     # Neighbours in dialogue order (source line order), not current time order.
     ordered = [s["id"] for s in source_segments if s["id"] in base_start]
@@ -292,10 +300,22 @@ def align_timing(segments, source_segments, words, report):
         # (repeated phrase elsewhere) would jump past them.
         new_start = seg["start"] + d
         r = rank[seg["id"]]
-        prev_start = base_start[ordered[r - 1]] if r > 0 else float("-inf")
-        next_start = base_start[ordered[r + 1]] if r + 1 < len(ordered) else float("inf")
-        if prev_start <= new_start <= next_start:
-            plan[seg["id"]] = (d, "line_misplaced")
+        prev_id = ordered[r - 1] if r > 0 else None
+        next_id = ordered[r + 1] if r + 1 < len(ordered) else None
+        prev_start = base_start[prev_id] if prev_id is not None else float("-inf")
+        next_start = base_start[next_id] if next_id is not None else float("inf")
+        if not (prev_start <= new_start <= next_start):
+            continue
+        # Subtitlers often delay a line on purpose so the previous one stays readable.
+        # Move toward the speech, but never leave the previous line (or this one, when
+        # moving later) shorter than its reading time.
+        if d < local and prev_id is not None:      # moving earlier: protect the previous line
+            new_start = max(new_start, prev_start + _min_read(text_by_id[prev_id]) + OVERLAP_GAP)
+        if d > local and next_id is not None:      # moving later: keep this line readable
+            new_start = min(new_start, next_start - _min_read(seg["text"]) - OVERLAP_GAP)
+        clamped = new_start - seg["start"]
+        if abs(clamped - local) >= SHIFT_MIN_LOCAL and (clamped - local) * (d - local) > 0:
+            plan[seg["id"]] = (clamped, "line_misplaced")
 
     moved = set()
     for seg in segments:
