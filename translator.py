@@ -10,6 +10,7 @@ import atexit
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ except ImportError:
 
 import anthropic
 import openai
+
+import qa
 
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
 BATCH_SIZE = 120
@@ -301,19 +304,59 @@ def _transcribe_file(audio_path, offset):
 def _transcribe_chunked(audio_path):
     chunks = split_audio(audio_path)
     all_segments = []
-    seen_starts = set()
 
-    for chunk_path, offset in chunks:
+    for n, (chunk_path, offset) in enumerate(chunks):
+        # Chunks overlap; each chunk owns only [offset, next_offset) to avoid duplicates.
+        owned_end = chunks[n + 1][1] if n + 1 < len(chunks) else float("inf")
         segs = _transcribe_file(chunk_path, offset=offset)
         for seg in segs:
-            if seg["start"] not in seen_starts:
-                seen_starts.add(seg["start"])
+            if offset <= seg["start"] < owned_end or (n == 0 and seg["start"] < owned_end):
                 all_segments.append(seg)
 
-    for i, seg in enumerate(sorted(all_segments, key=lambda s: s["start"])):
+    all_segments.sort(key=lambda s: s["start"])
+    for i, seg in enumerate(all_segments):
         seg["id"] = i
 
     return all_segments
+
+
+def transcribe_words(audio_path):
+    """Word-level Whisper transcript for QA timing checks. Returns [[word, start, end], ...]."""
+    if os.path.getsize(audio_path) <= WHISPER_MAX_BYTES:
+        chunks = [(audio_path, 0.0)]
+    else:
+        chunks = split_audio(audio_path)
+
+    client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    words = []
+    for n, (chunk_path, offset) in enumerate(chunks):
+        owned_end = chunks[n + 1][1] if n + 1 < len(chunks) else float("inf")
+        if len(chunks) > 1:
+            print(f"  Word transcript chunk {n + 1}/{len(chunks)}", flush=True)
+        for attempt in range(2):
+            try:
+                with open(chunk_path, "rb") as f:
+                    result = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word"],
+                    )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f"  Whisper error: {e} — retrying in 10s...")
+                    time.sleep(10)
+                else:
+                    print(f"  Warning: word transcript failed for chunk {n + 1} ({e})")
+                    result = None
+        for w in (getattr(result, "words", None) or []):
+            start = round(w.start + offset, 3)
+            if start < owned_end:
+                words.append([w.word, start, round(w.end + offset, 3)])
+
+    words.sort(key=lambda w: w[1])
+    return words
 
 
 # ---------------------------------------------------------------------------
@@ -592,12 +635,28 @@ def translate(segments, hints="", cache=None, cache_save=None):
     )
 
     if len(segments) <= BATCH_SIZE:
-        return _translate_batch(segments, hints=hints, system_prompt=system_prompt,
-                                speaker_map=speaker_map)
+        translated = _translate_batch(segments, hints=hints, system_prompt=system_prompt,
+                                      speaker_map=speaker_map)
+    else:
+        print(f"Translating {len(segments)} segments in batches of {BATCH_SIZE} (overlap {BATCH_OVERLAP})...")
+        translated = _translate_batched(segments, hints=hints, system_prompt=system_prompt,
+                                        speaker_map=speaker_map)
 
-    print(f"Translating {len(segments)} segments in batches of {BATCH_SIZE} (overlap {BATCH_OVERLAP})...")
-    return _translate_batched(segments, hints=hints, system_prompt=system_prompt,
-                              speaker_map=speaker_map)
+    # Never trust timestamps echoed back by the model — always use the source timing.
+    src_by_id = {s["id"]: s for s in segments}
+    drifted = sum(
+        1 for t in translated
+        if t.get("id") in src_by_id and (
+            abs(t.get("start", 0) - src_by_id[t["id"]]["start"]) > 0.001
+            or abs(t.get("end", 0) - src_by_id[t["id"]]["end"]) > 0.001)
+    )
+    if drifted:
+        print(f"  Restored source timestamps on {drifted} line(s) the model had altered")
+    return [
+        {**t, "start": src_by_id[t["id"]]["start"], "end": src_by_id[t["id"]]["end"]}
+        if t.get("id") in src_by_id else t
+        for t in translated
+    ]
 
 
 def _translate_batched(segments, hints, system_prompt, speaker_map):
@@ -745,7 +804,8 @@ def write_srt(segments, output_path):
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".flv", ".webm"}
 
 
-def process_file(input_path, output_path, hints, keep_audio, hf_token, no_diarize, subtitle_track=None):
+def process_file(input_path, output_path, hints, keep_audio, hf_token, no_diarize, subtitle_track=None,
+                 no_qa=False, qa_only=False):
     """Translate a single video file to Hebrew SRT."""
     cache = _load_cache(input_path)
     if cache:
@@ -808,13 +868,59 @@ def process_file(input_path, output_path, hints, keep_audio, hf_token, no_diariz
             print("  Get a free token at: https://huggingface.co/settings/tokens")
             print("  Accept license at: https://huggingface.co/pyannote/speaker-diarization-3.1")
 
-    # Step 4: Translate (gender analysis is cached inside translate())
-    print("Translating to Hebrew with Claude...")
-    translated = translate(segments, hints=hints, cache=cache,
-                           cache_save=lambda: _save_cache(input_path, cache))
+    if qa_only:
+        if not Path(output_path).exists():
+            print(f"No existing subtitles to QA: {output_path}")
+            return
+        print(f"QA only — loading existing subtitles: {output_path}")
+        translated = qa.pair_srt_with_source(qa.parse_srt(output_path), segments)
+    else:
+        # Step 4: Translate (gender analysis is cached inside translate())
+        print("Translating to Hebrew with Claude...")
+        translated = translate(segments, hints=hints, cache=cache,
+                               cache_save=lambda: _save_cache(input_path, cache))
 
-    # Step 5: Write SRT
-    write_srt(translated, output_path)
+        # Step 5: Write SRT
+        write_srt(translated, output_path)
+
+    # Step 6: QA — check against the real audio and review the Hebrew, auto-fix with backup
+    if no_qa:
+        return
+    run_qa_step(input_path, output_path, audio_path, segments, translated, hints, cache)
+
+
+def run_qa_step(input_path, output_path, audio_path, segments, translated, hints, cache):
+    print("Running QA pass...")
+    save = lambda: _save_cache(input_path, cache)
+
+    if cache.get("qa_words"):
+        words = cache["qa_words"]
+        print(f"Using cached word transcript: {len(words)} words")
+    else:
+        print("Transcribing audio with word timestamps (for timing check)...")
+        words = transcribe_words(audio_path)
+        print(f"  {len(words)} words")
+        if words:
+            cache["qa_words"] = words
+            save()
+
+    gender_context, speaker_map = analyze_genders(segments, hints=hints, cache=cache, cache_save=save)
+
+    fixed, report = qa.run_qa(segments, translated, words, gender_context, speaker_map)
+
+    out = Path(output_path)
+    backup_path = out.with_name(out.stem + ".pre-qa.srt")
+    report_path = out.with_name(out.stem + ".qa.json")
+    shutil.copyfile(output_path, backup_path)
+    print(f"Backup of pre-QA subtitles: {backup_path}")
+    write_srt(fixed, output_path)
+    report["files"] = {"srt": str(out), "backup": str(backup_path), "video": str(input_path)}
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    s = report["summary"]
+    print(f"QA done — {s['timing_changes']} timing, {s['text_fixes']} text, "
+          f"{s['structural_fixes']} structural fix(es); {s['flags']} flag(s), "
+          f"{s['warnings']} warning(s). Report: {report_path}")
 
 
 def main():
@@ -837,6 +943,10 @@ def main():
                         help="Re-translate even if .srt already exists")
     parser.add_argument("--subtitle-track", type=int, default=None, metavar="N",
                         help="1-indexed subtitle track to use (default: auto-select first English non-forced)")
+    parser.add_argument("--no-qa", action="store_true",
+                        help="Skip the QA pass (timing check against audio + Hebrew review)")
+    parser.add_argument("--qa-only", action="store_true",
+                        help="Only run QA on an existing .srt (no re-translation)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -863,14 +973,19 @@ def main():
         done, skipped, failed = 0, 0, 0
         for i, video in enumerate(videos, 1):
             output_path = str(video.with_suffix(".srt"))
-            if not args.force and Path(output_path).exists():
+            if args.qa_only and not Path(output_path).exists():
+                print(f"[{i}/{len(videos)}] Skipping (no .srt to QA): {video.name}")
+                skipped += 1
+                continue
+            if not args.qa_only and not args.force and Path(output_path).exists():
                 print(f"[{i}/{len(videos)}] Skipping (already translated): {video.name}")
                 skipped += 1
                 continue
             print(f"[{i}/{len(videos)}] Processing: {video.name}")
             try:
                 process_file(str(video), output_path, args.hints, args.keep_audio,
-                             hf_token, args.no_diarize, args.subtitle_track)
+                             hf_token, args.no_diarize, args.subtitle_track,
+                             no_qa=args.no_qa, qa_only=args.qa_only)
                 done += 1
             except Exception as e:
                 print(f"  ERROR: {e}")
@@ -882,9 +997,10 @@ def main():
 
     # Single file mode
     output_path = args.output or str(Path(args.input).with_suffix(".srt"))
-    if not args.force and Path(output_path).exists():
+    if not args.qa_only and not args.force and Path(output_path).exists():
         print(f"Output already exists: {output_path} (use --force to re-translate)")
-    process_file(args.input, output_path, args.hints, args.keep_audio, hf_token, args.no_diarize, args.subtitle_track)
+    process_file(args.input, output_path, args.hints, args.keep_audio, hf_token, args.no_diarize, args.subtitle_track,
+                 no_qa=args.no_qa, qa_only=args.qa_only)
 
 
 if __name__ == "__main__":
