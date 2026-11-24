@@ -60,6 +60,33 @@ python3 translator.py interview.mp4 --hints "female interviewer, male guest"
 python3 translator.py input.mp4 --keep-audio
 ```
 
+## QA pass (runs automatically after translation)
+
+After the `.srt` is written, a QA pass checks it against the real video and auto-fixes it:
+
+1. **Structure** — every subtitle keeps the source timestamp and its own line (the translation model sometimes alters timestamps or slides text into a neighbouring line).
+2. **Timing vs. audio** — the audio is transcribed again with Whisper *word* timestamps and every English source line is aligned to the speech. Constant offsets, drift (e.g. a subtitle track from a release with a different frame rate), jumps (cut scenes) and individually misplaced lines are corrected. If most lines don't match the audio at all, the subtitle track is probably wrong — QA warns and leaves timing alone.
+3. **Language review** — Claude re-reads every Hebrew line next to its English source, the speaker and the cast reference, and fixes wrong gender forms, misaligned lines, untranslated lines and clear mistranslations. It does not restyle correct lines.
+4. **Readability flags** — very fast reading speed, very short or empty lines (reported only).
+
+Files written next to the video:
+
+| File | What |
+|---|---|
+| `movie.srt` | Final, QA-fixed subtitles |
+| `movie.pre-qa.srt` | Backup of the subtitles before QA |
+| `movie.qa.json` | Report: every timing/text change (before → after, with reason), flags, warnings |
+
+```bash
+# QA an existing .srt without re-translating
+python3 translator.py movie.mkv --qa-only
+
+# Translate without QA
+python3 translator.py movie.mkv --no-qa
+```
+
+The word transcript is cached in `<video>.cache.json`, so re-running QA only costs the Claude review.
+
 ## Output
 
 - `.srt` file encoded as UTF-8 BOM for correct RTL Hebrew display in VLC and Windows media players
