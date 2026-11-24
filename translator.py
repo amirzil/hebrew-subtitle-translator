@@ -402,14 +402,26 @@ def diarize(audio_path, hf_token):
         pass  # CPU fallback is fine
 
     print("  Running diarization...")
+    # pyannote reads fixed-size chunks; MP3 decoding returns slightly short chunks and fails.
+    # Give it uncompressed 16 kHz mono WAV instead.
+    wav_path = make_temp(".wav")
+    conv = subprocess.run(
+        ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+        capture_output=True, text=True,
+    )
+    if conv.returncode != 0:
+        print(f"  Could not convert audio for diarization: {conv.stderr[-300:]}")
+        return None
     try:
-        diarization = pipeline(audio_path)
+        diarization = pipeline(wav_path)
     except Exception as e:
         print(f"  Diarization failed: {e}")
         return None
 
     turns = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    # pyannote 4.x wraps the result in DiarizeOutput; 3.x returns the Annotation directly.
+    annotation = getattr(diarization, "speaker_diarization", diarization)
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
         turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
 
     return turns
